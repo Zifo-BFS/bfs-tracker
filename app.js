@@ -1,11 +1,12 @@
 // =====================================================================
 //  BFS/ BES Tracker  –  app.js
-//  Data lives in a private GitHub repo. gh-api.js does all reading and
-//  writing. Roles: admin (everything) · user (own Allocation edit,
-//  BLL + Salesforce view)
+//  Admin signs in with a GitHub token. The team signs in with a
+//  username + passphrase (see gh-auth.js). Data lives in a private
+//  GitHub repo; gh-api.js does all reading and writing.
 // =====================================================================
 import { APP_NAME } from "./config.js";
 import { api, ghOpenEvents } from "./gh-api.js";
+import { ghAddTeamLogin, ghRemoveTeamLogin, ghToken } from "./gh-auth.js";
 
 /* ===================== defaults ===================== */
 const DEFAULT_CFG = {
@@ -52,37 +53,40 @@ const keyOf = (d, o, p, t) => `${d}~${slug(o)}~${slug(p)}~${slug(t)}`;
 const $ = id => document.getElementById(id);
 
 /* ===================== state ===================== */
-const S = { me: null, profile: null, cfg: structuredClone(DEFAULT_CFG), entries: new Map(), users: [], unsub: [] };
+const S = { me: null, profile: null, cfg: structuredClone(DEFAULT_CFG), entries: new Map(), users: [], sharedToken: "" };
 const isAdmin = () => S.profile?.role === "admin";
 const myMember = () => S.profile?.member || "";
 const canEditOwner = o => isAdmin() || (!!myMember() && o === myMember());
 
 /* ===================== auth screens ===================== */
-let authMode = "in";
-function showAuth(mode) {
-  authMode = "in";
+let authMode = "team";
+function showAuth() {
   ["auth", "pending", "shell"].forEach(x => $(x).classList.add("hide"));
   $("auth").classList.remove("hide");
-  $("authTitle").textContent = "Sign in";
-  $("nameRow").classList.add("hide");
-  if ($("emailRow")) $("emailRow").classList.add("hide");
-  $("pwRow").classList.remove("hide");
-  $("aBtn").textContent = "Sign in";
-  $("toSignup").classList.add("hide");
-  $("toReset").classList.add("hide");
+  const team = authMode === "team";
+  $("authTitle").textContent = team ? "Sign in" : "Admin sign-in";
+  $("authSub").textContent = team ? "Use the username and passphrase your admin gave you."
+                                  : "Paste your GitHub access token.";
+  $("userRow").classList.toggle("hide", !team);
+  $("passRow").classList.toggle("hide", !team);
+  $("tokRow").classList.toggle("hide", team);
+  $("toAdmin").textContent = team ? "Admin sign-in with GitHub token" : "Back to team sign-in";
   $("aErr").textContent = "";
 }
+$("toAdmin").onclick = () => { authMode = authMode === "team" ? "admin" : "team"; showAuth(); };
 $("authForm").onsubmit = async e => {
   e.preventDefault();
   $("aErr").textContent = ""; $("aBtn").disabled = true;
-  try { await api("/api/login", "POST", { token: $("aPw").value.trim() }); await boot(); }
-  catch (err) { $("aErr").textContent = err.message || "Something went wrong."; }
+  try {
+    if (authMode === "admin") await api("/api/login", "POST", { token: $("aPw").value.trim() });
+    else await api("/api/login", "POST", { username: $("aUser").value.trim(), passphrase: $("aPass").value.trim() });
+    await boot();
+  } catch (err) { $("aErr").textContent = err.message || "Something went wrong."; }
   $("aBtn").disabled = false;
 };
 async function logout() { try { await api("/api/logout", "POST"); } catch (e) {} location.reload(); }
 $("pendingOut").onclick = logout;
 $("signOut").onclick = logout;
-$("pwBtn").onclick = () => toast("Sign-in is managed by GitHub. To change it, sign out and sign in with a new token.");
 
 /* ===================== start-up + realtime ===================== */
 let es = null;
@@ -92,9 +96,10 @@ async function loadState() {
   if (st.cfg) S.cfg = { ...DEFAULT_CFG, ...st.cfg };
   S.entries = new Map(Object.entries(st.entries || {}));
   S.users = st.users || [];
+  S.sharedToken = st.sharedToken || "";
 }
 async function boot() {
-  try { S.profile = await api("/api/me"); } catch (e) { showAuth("in"); return; }
+  try { S.profile = await api("/api/me"); } catch (e) { showAuth(); return; }
   S.me = { uid: S.profile.uid };
   openEvents();
   if (!S.profile.active) { showPending(); return; }
@@ -464,19 +469,33 @@ function vSet() {
 
 /* ===================== USERS (admin) ===================== */
 function vUsers() {
-  const us = S.users.slice().sort((a, b) => (a.active === b.active ? 0 : a.active ? 1 : -1) || String(a.name).localeCompare(String(b.name)));
-  return `<h1>Users & roles</h1>
-  <p class="lede">People appear here after they sign in with their GitHub token. Approve them and link each one to their team name so they can edit their own allocation.</p>
-  <div class="scroll"><table><thead><tr><th>Name</th><th>GitHub</th><th>Team name</th><th>Role</th><th>Access</th></tr></thead><tbody>
-  ${us.map(u => `<tr><td>${esc(u.name)}</td><td class="muted">${esc(u.uid)}</td>
+  const us = S.users.slice().sort((a, b) => String(a.name).localeCompare(String(b.name)));
+  const tokSet = !!S.sharedToken;
+  return `<h1>Users &amp; sign-ins</h1>
+  <p class="lede">Create a username for each person, then give them the passphrase. They sign in from any phone or laptop — no GitHub account needed.</p>
+  <h2>Shared team token</h2>
+  <div class="card">
+    <p style="margin-top:0">${tokSet ? `<span class="pill ok">Set</span> Team sign-ins are working.`
+      : `<span class="pill bad">Not set</span> Paste the <b>shared team token</b> (the one limited to <code>bfs-tracker-data</code>). Until this is set you cannot create team logins.`}</p>
+    <label class="f">Shared team token<input id="shTok" type="password" placeholder="github_pat_..." style="width:100%;max-width:460px"></label>
+    <p><button class="btn pri sm" data-act="saveShared">Save shared token</button></p>
+    <p class="note">Stored in your private data repo. Replace it if anyone leaves the team, then reset everyone’s passphrase.</p>
+  </div>
+  <h2>Team</h2>
+  <div class="card"><label class="f">Add a person — username<input id="newUser" placeholder="anjali" style="width:200px"></label>
+   <p><button class="btn pri sm" data-act="addUser" ${tokSet ? "" : "disabled"}>Create sign-in</button></p></div>
+  <div class="scroll" style="margin-top:14px"><table><thead><tr><th>Name</th><th>Username</th><th>Team name</th><th>Role</th><th>Active</th><th>Sign-in</th></tr></thead><tbody>
+  ${us.map(u => `<tr><td>${esc(u.name)}</td><td class="muted">${esc(u.username)}</td>
    <td><select data-uid="${esc(u.uid)}" data-uf="member"><option value="">– not linked –</option>${S.cfg.team.map(t => `<option ${t === u.member ? "selected" : ""}>${esc(t)}</option>`).join("")}</select></td>
    <td><select data-uid="${esc(u.uid)}" data-uf="role" ${u.uid === S.me.uid ? "disabled" : ""}><option value="user" ${u.role !== "admin" ? "selected" : ""}>User</option><option value="admin" ${u.role === "admin" ? "selected" : ""}>Admin</option></select></td>
-   <td>${u.uid === S.me.uid ? `<span class="pill ok">You</span>` : `<button class="btn sm ${u.active ? "" : "pri"}" data-act="toggleUser" data-uid="${esc(u.uid)}">${u.active ? "Deactivate" : "Approve"}</button>`}</td></tr>`).join("")}
+   <td>${u.uid === S.me.uid ? `<span class="pill ok">You</span>` : `<button class="btn sm ${u.active ? "" : "pri"}" data-act="toggleUser" data-uid="${esc(u.uid)}">${u.active ? "Deactivate" : "Activate"}</button>`}</td>
+   <td>${String(u.uid).startsWith("gh:") ? `<span class="muted">GitHub admin</span>`
+      : `<button class="btn sm" data-act="resetPass" data-uid="${esc(u.uid)}">New passphrase</button>
+         <button class="btn sm" data-act="delUser" data-uid="${esc(u.uid)}">Remove</button>`}</td></tr>`).join("")}
   </tbody></table></div>
   <div class="card" style="margin-top:16px"><b>What each role can do</b>
-   <p style="margin:8px 0 0"><span class="role admin">Admin</span> every page, edit everything, approve users, Setup, Reports and Analysis.</p>
-   <p style="margin:6px 0 0"><span class="role">User</span> Allocation – edit own rows only · BLL Tracker – view · Salesforce – view, copy and download own timecard.</p>
-   <p class="note">To remove someone completely, also remove them from the GitHub organisation and revoke their token.</p></div>`;
+   <p style="margin:8px 0 0"><span class="role admin">Admin</span> everything, including Setup, Users, Analysis and Reports.</p>
+   <p style="margin:6px 0 0"><span class="role">User</span> Allocation (own rows), BLL, Salesforce and Reports — view, export and download.</p></div>`;
 }
 
 /* ===================== events ===================== */
@@ -530,8 +549,40 @@ $("app").addEventListener("click", async e => {
   if (a === "rpRange") { const r = b.dataset.r; if (r === "week") { U.rpFrom = monday(today); U.rpTo = add(U.rpFrom, 4); } if (r === "month") { U.rpFrom = today.slice(0, 8) + "01"; U.rpTo = add(I(new Date(Date.UTC(+today.slice(0, 4), +today.slice(5, 7), 1))), -1); } if (r === "all") { const ds = [...S.entries.values()].map(x => x.date).sort(); U.rpFrom = ds[0] || today; U.rpTo = ds[ds.length - 1] || today; } }
   if (a === "rpXlsx") { xlsxSave(`${slug(REPORTS[U.rpType].split(" (")[0])}_${U.rpFrom}_${U.rpTo}.xlsx`, buildReport(U.rpType, U.rpFrom, U.rpTo, U.rpUser, U.rpProj)); return; }
   if (a === "rpCsv") { const s = buildReport(U.rpType, U.rpFrom, U.rpTo, U.rpUser, U.rpProj)[0]; if (s) downloadCsv(`${slug(s[0])}_${U.rpFrom}_${U.rpTo}.csv`, s[1]); return; }
+
+  if (a === "saveShared") {
+    const t = $("shTok").value.trim(); if (!t) { toast("Paste the shared token first"); return; }
+    try { await api("/api/shared", "PUT", { token: t }); S.sharedToken = t; toast("Shared token saved"); route(); }
+    catch (er) { toast(er.message); } return;
+  }
+  if (a === "addUser") {
+    const name = $("newUser").value.trim(); if (!name) { toast("Enter a username"); return; }
+    try {
+      const pass = await ghAddTeamLogin(name, S.sharedToken, ghToken());
+      await api("/api/users/" + encodeURIComponent(name.toLowerCase()), "PUT",
+        { username: name, name, role: "user", active: true, hasLogin: true });
+      await loadState(); route();
+      prompt(`Sign-in created for ${name}.\n\nSend them the username and this passphrase.\nIt cannot be shown again — copy it now:`, pass);
+    } catch (er) { toast(er.message); } return;
+  }
+  if (a === "resetPass") {
+    const uid = b.dataset.uid; const u = S.users.find(x => x.uid === uid); if (!u) return;
+    if (!confirm(`Give ${u.name} a new passphrase? Their current one stops working.`)) return;
+    try { const pass = await ghAddTeamLogin(u.username, S.sharedToken, ghToken());
+      prompt(`New passphrase for ${u.name} — copy it now:`, pass); }
+    catch (er) { toast(er.message); } return;
+  }
+  if (a === "delUser") {
+    const uid = b.dataset.uid; const u = S.users.find(x => x.uid === uid); if (!u) return;
+    if (!confirm(`Remove ${u.name}? Their recorded hours stay.`)) return;
+    try { await ghRemoveTeamLogin(u.username, ghToken());
+      await api("/api/users/" + encodeURIComponent(uid), "DELETE");
+      await loadState(); route(); toast("Removed"); }
+    catch (er) { toast(er.message); } return;
+  }
   if (a === "toggleUser") { const u = S.users.find(x => x.uid === b.dataset.uid); if (!u) return;
-    try { await api("/api/users/" + encodeURIComponent(u.uid), "PATCH", { active: !u.active }); await loadState(); route(); toast(u.active ? "Deactivated" : "Approved – remember to link a team name"); } catch (er) { toast("Couldn’t update: " + er.message); } return; }
+    try { await api("/api/users/" + encodeURIComponent(u.uid), "PATCH", { active: !u.active }); await loadState(); route(); toast(u.active ? "Deactivated" : "Activated – remember to link a team name"); } catch (er) { toast("Couldn’t update: " + er.message); } return; }
+
   if (isAdmin()) {
     if (a === "addTeam") { c.team.push("New person"); saveCfg(); }
     if (a === "delTeam") { if (!confirm("Remove " + c.team[+b.dataset.i] + "? Their hours stay stored.")) return; c.team.splice(+b.dataset.i, 1); saveCfg(); }
