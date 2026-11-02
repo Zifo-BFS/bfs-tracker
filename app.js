@@ -1,8 +1,8 @@
 // =====================================================================
-//  BFS/ BES Tracker  –  app.js
+//  BFS/ BES Tracker  –  app.js   (Stage 2: three-level hierarchy)
 //  Admin signs in with a GitHub token. The team signs in with a
-//  username + passphrase (see gh-auth.js). Data lives in a private
-//  GitHub repo; gh-api.js does all reading and writing.
+//  username + passphrase (gh-auth.js). Data lives in a private GitHub
+//  repo; gh-api.js does all reading and writing.
 // =====================================================================
 import { APP_NAME } from "./config.js";
 import { api, ghOpenEvents } from "./gh-api.js";
@@ -30,6 +30,7 @@ const DEFAULT_CFG = {
   assign: { Anieya: ["BES", "Lilly", "BFS", "Internal"], Anjali: ["BFS", "BES", "Lilly", "Internal"], Sarath: ["BES", "Internal"],
             Gayathri: ["BFS", "Lilly", "Internal"], Ann: ["Internal", "Lilly", "BFS"], Varsha: ["BFS", "BES", "Internal"] },
   resIds: {},
+  nodes: {}, assigns: [],
   bllStart: "2026-05-11", bllWeeks: 34
 };
 const PCOL = ["--p1", "--p2", "--p3", "--p4", "--p5", "--p6"];
@@ -97,6 +98,9 @@ async function loadState() {
   S.entries = new Map(Object.entries(st.entries || {}));
   S.users = st.users || [];
   S.sharedToken = st.sharedToken || "";
+  const fresh = migrateToNodes();
+  syncLegacy();
+  if (fresh && isAdmin()) saveCfg();
 }
 async function boot() {
   try { S.profile = await api("/api/me"); } catch (e) { showAuth(); return; }
@@ -176,6 +180,87 @@ function rows(f = {}) {
 const sum = (a, k) => a.reduce((s, e) => s + (+e[k] || 0), 0);
 const weeks = () => Array.from({ length: +S.cfg.bllWeeks || 34 }, (_, i) => add(monday(S.cfg.bllStart), 7 * i));
 const workdays = (a, b) => { const out = []; for (let d = a; d <= b && out.length < 400; d = add(d, 1)) if (dow(d) < 5) out.push(d); return out; };
+
+/* ===================== HIERARCHY (3 levels, permanent IDs) ===================== */
+const TOP_DEFAULT = [
+  { id: "BFS", name: "BFS",      mode: "project" },
+  { id: "BES", name: "BES",      mode: "project" },
+  { id: "INT", name: "Internal", mode: "primary" }
+];
+function nodes() { return (S.cfg.nodes ??= {}); }
+const node = id => nodes()[id];
+const childrenOf = (pid, kind) => Object.values(nodes())
+  .filter(n => n.parent === pid && (!kind || n.kind === kind))
+  .sort((a, b) => (a.ord || 0) - (b.ord || 0) || String(a.name).localeCompare(String(b.name)));
+const tops = () => Object.values(nodes()).filter(n => n.kind === "top").sort((a, b) => (a.ord || 0) - (b.ord || 0));
+const midLabel  = t => t && t.mode === "primary" ? "Primary task"   : "Project";
+const taskLabel = t => t && t.mode === "primary" ? "Secondary task" : "Task";
+const topOf = n => { let x = n, g = 0; while (x && x.kind !== "top" && g++ < 5) x = node(x.parent); return x; };
+const activeOn = (as, d) => (!as.from || d >= as.from) && (!as.to || d <= as.to);
+
+function nextId(prefix, pad = 3) {
+  let i = 1;
+  while (nodes()[prefix + String(i).padStart(pad, "0")]) i++;
+  return prefix + String(i).padStart(pad, "0");
+}
+function addTop(name) {
+  const base = (slug(name).toUpperCase().replace(/-/g, "").slice(0, 6)) || "TOP";
+  let id = base, i = 2; while (nodes()[id]) id = base + (i++);
+  nodes()[id] = { id, kind: "top", name, mode: "project", hidden: false, ord: tops().length + 1 };
+  return id;
+}
+function addMid(topId, name) {
+  const id = nextId(topId + "_PRJ_");
+  nodes()[id] = { id, kind: "mid", parent: topId, name, billable: topId !== "INT",
+                  planned: 0, cost: "", sf: "", type: "", hidden: false, ord: childrenOf(topId, "mid").length + 1 };
+  return id;
+}
+function addTask(midId, name) {
+  const id = nextId(midId + "_TSK_");
+  nodes()[id] = { id, kind: "task", parent: midId, name,
+                  billable: node(midId) ? node(midId).billable !== false : true,
+                  hidden: false, ord: childrenOf(midId, "task").length + 1 };
+  return id;
+}
+function migrateToNodes() {
+  if (S.cfg.nodes && Object.keys(S.cfg.nodes).length) return false;
+  S.cfg.nodes = {};
+  TOP_DEFAULT.forEach((t, i) => { S.cfg.nodes[t.id] = { ...t, kind: "top", hidden: false, ord: i + 1 }; });
+  const map = {};
+  (S.cfg.projects || []).forEach(p => {
+    const n = String(p.name), ty = String(p.type || "");
+    let topId = "BFS";
+    if (/^bes$/i.test(n) || /\bBES\b/i.test(ty)) topId = "BES";
+    if (/^internal$/i.test(n) || /internal/i.test(ty)) topId = "INT";
+    const id = addMid(topId, n);
+    Object.assign(S.cfg.nodes[id], { billable: !!p.billable, planned: +p.planned || 0,
+      cost: p.cost ?? "", sf: p.sf || "", type: ty });
+    map[n] = id;
+    (S.cfg.tasks || []).forEach(t => addTask(id, t));
+  });
+  S.cfg.nameMap = map;
+  S.cfg.assigns = [];
+  Object.entries(S.cfg.assign || {}).forEach(([person, list]) =>
+    (list || []).forEach(pn => { if (map[pn]) S.cfg.assigns.push({ person, node: map[pn], from: "", to: "" }); }));
+  return true;
+}
+function syncLegacy() {
+  const mids = Object.values(nodes()).filter(n => n.kind === "mid" && !n.hidden);
+  if (mids.length) {
+    S.cfg.projects = mids.map(n => ({ name: n.name, type: n.type || (node(n.parent) || {}).name || "",
+      billable: !!n.billable, planned: +n.planned || 0, cost: n.cost ?? "", sf: n.sf || "" }));
+    const tn = [...new Set(Object.values(nodes()).filter(n => n.kind === "task" && !n.hidden).map(n => n.name))];
+    if (tn.length) S.cfg.tasks = tn;
+  }
+  const a = {};
+  (S.cfg.assigns || []).forEach(x => {
+    const n = node(x.node); if (!n || n.hidden) return;
+    if (!activeOn(x, today)) return;
+    (a[x.person] ??= []); if (!a[x.person].includes(n.name)) a[x.person].push(n.name);
+  });
+  if (Object.keys(a).length) S.cfg.assign = a;
+}
+function saveNodes() { syncLegacy(); saveCfg(); }
 
 /* ===================== routing / permissions ===================== */
 const ALL_VIEWS = [
@@ -392,7 +477,8 @@ const REPORTS = {
   bll: "BLL workbook (team + one sheet per person)",
   sf: "Salesforce Timecard import (all people, each week in range)",
   prima: "Prima weekly hours (each week in range)",
-  compliance: "8-hour compliance by person and day"
+  compliance: "8-hour compliance by person and day",
+  structure: "Work structure (all IDs, levels and assignments)"
 };
 function buildReport(type, from, to, owner, project) {
   const A = analyse(from, to, owner, project), sheets = [];
@@ -405,6 +491,13 @@ function buildReport(type, from, to, owner, project) {
     ...A.R.slice().sort((a, b) => a.date.localeCompare(b.date) || String(a.owner).localeCompare(String(b.owner))).map(e => [e.date, monday(e.date), String(e.owner).trim(), e.project, e.task, e.est ?? "", e.act ?? "", isBill(e.project) ? "Yes" : "No", e.comment || "", e.updatedByName || ""])];
   const projStatus = () => { const D = projectDetails(); return [["Project", "Type", "Billable", "Planned h", "Cost", "Logged h (all time)", "Billable h", "Remaining h", "% complete", ...D.months.map(m => `% ${m[2]}`), "Accrual", "Status", "SF Assignment ID"],
     ...D.rows.map(x => [x.p.name, x.p.type, x.p.billable ? "Yes" : "No", x.pl, x.p.cost, +x.lg.toFixed(2), +x.bl.toFixed(2), x.pl ? +(x.pl - x.lg).toFixed(2) : "", x.pc == null ? "" : +(x.pc * 100).toFixed(1), ...x.mons.map(v => v == null ? "" : +(v * 100).toFixed(1)), x.accr == null ? "" : Math.round(x.accr), x.st, x.p.sf || ""])]; };
+  const structure = () => { const out = [["ID", "Level", "Parent ID", "Name", "Billable", "Planned h", "Cost", "SF ID", "Hidden"]];
+    tops().forEach(t => { out.push([t.id, "Top", "", t.name, "", "", "", "", t.hidden ? "Yes" : "No"]);
+      childrenOf(t.id, "mid").forEach(m => { out.push([m.id, midLabel(t), t.id, m.name, m.billable ? "Yes" : "No", +m.planned || 0, m.cost ?? "", m.sf || "", m.hidden ? "Yes" : "No"]);
+        childrenOf(m.id, "task").forEach(k => out.push([k.id, taskLabel(t), m.id, k.name, k.billable ? "Yes" : "No", "", "", "", k.hidden ? "Yes" : "No"])); }); });
+    return out; };
+  const assignSheet = () => [["Person", "Node ID", "Name", "From", "To", "Status"],
+    ...(S.cfg.assigns || []).map(a => { const n = node(a.node) || {}; return [a.person, a.node, n.name || "", a.from || "", a.to || "", activeOn(a, today) ? "Active" : "Ended"]; })];
   const weeksIn = (startFn) => { const out = []; for (let w = startFn(from); w <= to; w = add(w, 7)) out.push(w); return out.length ? out : [startFn(from)]; };
   const owners = owner === "__all" ? S.cfg.team : [owner];
   if (type === "summary") {
@@ -417,6 +510,7 @@ function buildReport(type, from, to, owner, project) {
   if (type === "person") sheets.push(["Person summary", people()]);
   if (type === "project") sheets.push(["Project status", projStatus()], ["Hours in range", projs()]);
   if (type === "compliance") sheets.push(["8-hour check", comp()]);
+  if (type === "structure") sheets.push(["Structure", structure()], ["Assignments", assignSheet()]);
   if (type === "bll") {
     const W = weeks();
     ["__all", ...owners].filter((v, i, a) => a.indexOf(v) === i).forEach(o => { const sh = [];
@@ -449,21 +543,75 @@ function vReports() {
 /* ===================== SETUP (admin) ===================== */
 function vSet() {
   const c = S.cfg;
-  return `<h1>Setup</h1><p class="lede">Team, projects, task types and who works on what. Changes save straight away and everyone sees them.</p>
+  const taskRow = (m, t) => `<tr><td class="muted num" style="font-size:11px">${esc(t.id)}</td>
+    <td><input data-nd="${esc(t.id)}" data-nk="name" value="${esc(t.name)}" style="width:190px"></td>
+    <td style="text-align:center"><input type="checkbox" data-nd="${esc(t.id)}" data-nk="billable" ${t.billable ? "checked" : ""}></td>
+    <td><button class="btn sm" data-act="hideNode" data-id="${esc(t.id)}">${t.hidden ? "Unhide" : "Hide"}</button></td></tr>`;
+
+  const midCard = (top, m) => `<div class="card" style="margin:10px 0 0 18px;${m.hidden ? "opacity:.5" : ""}">
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:end">
+      <label class="f">${esc(midLabel(top))} name<input data-nd="${esc(m.id)}" data-nk="name" value="${esc(m.name)}" style="width:170px"></label>
+      <label class="f">Type / note<input data-nd="${esc(m.id)}" data-nk="type" value="${esc(m.type || "")}" style="width:190px"></label>
+      <label class="f">Planned h<input class="n" data-nd="${esc(m.id)}" data-nk="planned" value="${esc(m.planned ?? 0)}" style="width:72px"></label>
+      <label class="f">Cost<input data-nd="${esc(m.id)}" data-nk="cost" value="${esc(m.cost ?? "")}" style="width:86px"></label>
+      <label class="f">SF Assignment ID<input data-nd="${esc(m.id)}" data-nk="sf" value="${esc(m.sf || "")}" style="width:160px"></label>
+      <label class="f">Billable<input type="checkbox" data-nd="${esc(m.id)}" data-nk="billable" ${m.billable ? "checked" : ""}></label>
+      <button class="btn sm" data-act="hideNode" data-id="${esc(m.id)}">${m.hidden ? "Unhide" : "Hide"}</button>
+    </div>
+    <p class="note" style="margin:6px 0 0">ID <code>${esc(m.id)}</code> — permanent. Renaming is safe; hours stay linked.</p>
+    <div class="scroll" style="margin-top:8px"><table><thead><tr><th style="width:150px">ID</th><th>${esc(taskLabel(top))}</th><th style="width:70px;text-align:center">Billable</th><th style="width:90px"></th></tr></thead>
+      <tbody>${childrenOf(m.id, "task").map(t => taskRow(m, t)).join("") || `<tr><td colspan="4" class="muted">No ${esc(taskLabel(top)).toLowerCase()}s yet.</td></tr>`}</tbody></table></div>
+    <p style="margin:8px 0 0"><button class="btn sm" data-act="addTask" data-id="${esc(m.id)}">+ Add ${esc(taskLabel(top).toLowerCase())}</button></p>
+  </div>`;
+
+  const topCard = t => `<div class="card" style="margin-bottom:16px;${t.hidden ? "opacity:.5" : ""}">
+    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:end">
+      <label class="f">Top level<input data-nd="${esc(t.id)}" data-nk="name" value="${esc(t.name)}" style="width:150px"></label>
+      <label class="f">Structure<select data-nd="${esc(t.id)}" data-nk="mode">
+        <option value="project" ${t.mode !== "primary" ? "selected" : ""}>Project → Task</option>
+        <option value="primary" ${t.mode === "primary" ? "selected" : ""}>Primary → Secondary task</option></select></label>
+      <span class="ro">ID ${esc(t.id)}</span>
+      <button class="btn sm" data-act="hideNode" data-id="${esc(t.id)}">${t.hidden ? "Unhide" : "Hide"}</button>
+    </div>
+    ${childrenOf(t.id, "mid").map(m => midCard(t, m)).join("")}
+    <p style="margin:12px 0 0"><button class="btn sm pri" data-act="addMid" data-id="${esc(t.id)}">+ Add ${esc(midLabel(t).toLowerCase())}</button></p>
+  </div>`;
+
+  const midOpts = sel => tops().map(t => `<optgroup label="${esc(t.name)}">` +
+    childrenOf(t.id, "mid").map(m => `<option value="${esc(m.id)}" ${m.id === sel ? "selected" : ""}>${esc(m.name)}${m.hidden ? " (hidden)" : ""}</option>`).join("") +
+    `</optgroup>`).join("");
+
+  const asg = c.assigns || [];
+  const asgRows = asg.map((a, i) => {
+    const live = activeOn(a, today);
+    return `<tr><td><select data-asg="${i}" data-af="person">${c.team.map(u => `<option ${u === a.person ? "selected" : ""}>${esc(u)}</option>`).join("")}</select></td>
+    <td><select data-asg="${i}" data-af="node">${midOpts(a.node)}</select></td>
+    <td><input type="date" data-asg="${i}" data-af="from" value="${esc(a.from || "")}"></td>
+    <td><input type="date" data-asg="${i}" data-af="to" value="${esc(a.to || "")}"></td>
+    <td><span class="pill ${live ? "ok" : "warn"}">${live ? "Active" : "Ended"}</span></td>
+    <td><button class="btn sm" data-act="delAsg" data-i="${i}">✕</button></td></tr>`;
+  }).join("");
+
+  return `<h1>Setup</h1>
+  <p class="lede">Your work structure has three levels. Every item keeps a permanent ID, so you can rename anything without breaking past hours, and hide anything without deleting its history.</p>
+
   <h2>Team</h2><div class="card settings">${c.team.map((u, i) => `<span style="display:inline-flex;gap:6px;margin:0 10px 8px 0;align-items:center"><i class="dot" style="background:${color(u)}"></i><input data-team="${i}" value="${esc(u)}" style="width:130px"><input data-rid="${esc(u)}" placeholder="SF Resource ID" value="${esc((c.resIds || {})[u] || "")}" style="width:150px"><button class="btn sm" data-act="delTeam" data-i="${i}">✕</button></span>`).join("")}
    <div><button class="btn sm" data-act="addTeam">+ Add person</button></div></div>
-  <h2>Projects</h2><div class="scroll settings"><table><thead><tr><th>Name</th><th>Type</th><th>Billable</th><th class="n">Planned h</th><th>Cost</th><th>SF Assignment ID</th><th></th></tr></thead><tbody>
-   ${c.projects.map((p, i) => `<tr><td><input data-pj="${i}" data-k="name" value="${esc(p.name)}" style="width:120px"></td><td><input data-pj="${i}" data-k="type" value="${esc(p.type)}" style="width:220px"></td>
-   <td><input type="checkbox" data-pj="${i}" data-k="billable" ${p.billable ? "checked" : ""}></td><td><input data-pj="${i}" data-k="planned" value="${esc(p.planned)}" style="width:70px" class="n"></td>
-   <td><input data-pj="${i}" data-k="cost" value="${esc(p.cost)}" style="width:80px"></td><td><input data-pj="${i}" data-k="sf" value="${esc(p.sf)}" style="width:170px"></td><td><button class="btn sm" data-act="delPj" data-i="${i}">✕</button></td></tr>`).join("")}
-   </tbody></table></div><p><button class="btn sm" data-act="addPj">+ Add project</button></p>
-  <h2>Task types</h2><div class="card settings">${c.tasks.map((t, i) => `<span style="display:inline-flex;gap:4px;margin:0 10px 8px 0"><input data-task="${i}" value="${esc(t)}" style="width:150px"><button class="btn sm" data-act="delTask" data-i="${i}">✕</button></span>`).join("")}<div><button class="btn sm" data-act="addTask">+ Add task type</button></div></div>
-  <h2>Assignments</h2><p class="muted" style="margin-top:-4px">Ticked projects appear on the person’s allocation. Nobody ticked = all projects.</p>
-  <div class="scroll"><table class="matrix"><thead><tr><th>Project</th>${c.team.map(u => `<th>${esc(u)}</th>`).join("")}</tr></thead><tbody>
-   ${c.projects.map(p => `<tr><td>${esc(p.name)}</td>${c.team.map(u => `<td><input type="checkbox" data-as="${esc(u)}" data-p="${esc(p.name)}" ${(c.assign[u] || []).includes(p.name) ? "checked" : ""}></td>`).join("")}</tr>`).join("")}
-   </tbody></table></div>
+
+  <h2>Work structure</h2>
+  ${tops().map(topCard).join("")}
+  <div class="controls"><label class="f">New top level name<input id="newTop" placeholder="e.g. Lilly" style="width:180px"></label>
+   <button class="btn sm" data-act="addTop">+ Add top level</button></div>
+
+  <h2>Assignments</h2>
+  <p class="muted" style="margin-top:-4px">Who works on what, and between which dates. Leave dates blank for “always”. Ending an assignment removes it from future allocation screens — past hours are never lost.</p>
+  <div class="scroll"><table><thead><tr><th>Person</th><th>Project / Primary task</th><th>From</th><th>To</th><th>Status</th><th></th></tr></thead>
+   <tbody>${asgRows || `<tr><td colspan="6" class="muted">No assignments yet — nobody is restricted, so everyone sees everything.</td></tr>`}</tbody></table></div>
+  <p><button class="btn sm pri" data-act="addAsg">+ Add assignment</button></p>
+
   <h2>BLL weeks</h2><div class="controls"><label class="f">First week (Monday)<input type="date" id="bllStart" value="${c.bllStart}"></label><label class="f">Number of weeks<input type="number" id="bllWeeks" min="1" max="104" value="${c.bllWeeks}"></label></div>
-  <h2>Import</h2><div class="card"><p style="margin-top:0">Import an existing allocation workbook (Date · Owner · Project · Task · Estimated · Actual · Comments; merged cells are fine). New people, projects and task types are added here automatically.</p>
+
+  <h2>Import</h2><div class="card"><p style="margin-top:0">Import an existing allocation workbook (Date · Owner · Project · Task · Estimated · Actual · Comments; merged cells are fine).</p>
    <input type="file" id="imp" accept=".xlsx,.xls,.xlsm"><p class="note">${S.entries.size} entries stored.</p></div>`;
 }
 
@@ -519,19 +667,35 @@ $("app").addEventListener("input", e => {
     setEntry(d.d, d.u, d.p, d.t, { [d.f]: v }); updTotals(d.d, d.u); return;
   }
   if (!isAdmin()) return;
-  if (d.team !== undefined) { const old = S.cfg.team[+d.team], nw = t.value.trim(); if (!nw) return; S.cfg.team[+d.team] = nw; if (S.cfg.assign[old] && nw !== old) { S.cfg.assign[nw] = S.cfg.assign[old]; delete S.cfg.assign[old]; } saveCfg(); return; }
+  if (d.nd !== undefined) {
+    const n = node(d.nd); if (!n) return;
+    if (d.nk === "planned") n.planned = +t.value || 0;
+    else if (d.nk === "cost") n.cost = t.value !== "" && !isNaN(+t.value) ? +t.value : t.value;
+    else n[d.nk] = t.value;
+    saveNodes(); return;
+  }
+  if (d.asg !== undefined) {
+    const a = (S.cfg.assigns || [])[+d.asg]; if (!a) return;
+    a[d.af] = t.value; saveNodes(); return;
+  }
+  if (d.team !== undefined) { const old = S.cfg.team[+d.team], nw = t.value.trim(); if (!nw) return; S.cfg.team[+d.team] = nw; if (S.cfg.assign[old] && nw !== old) { S.cfg.assign[nw] = S.cfg.assign[old]; delete S.cfg.assign[old]; }
+    (S.cfg.assigns || []).forEach(a => { if (a.person === old) a.person = nw; }); saveCfg(); return; }
   if (d.rid !== undefined) { (S.cfg.resIds ??= {})[d.rid] = t.value.trim(); saveCfg(); return; }
-  if (d.task !== undefined) { S.cfg.tasks[+d.task] = t.value; saveCfg(); return; }
-  if (d.pj !== undefined && t.type !== "checkbox") { const p = S.cfg.projects[+d.pj]; if (d.k === "name") { const old = p.name; Object.values(S.cfg.assign).forEach(a => { const i = a.indexOf(old); if (i >= 0) a[i] = t.value; }); }
-    p[d.k] = d.k === "planned" ? (+t.value || 0) : d.k === "cost" && t.value !== "" && !isNaN(+t.value) ? +t.value : t.value; saveCfg(); }
 });
 $("app").addEventListener("change", async e => {
   const t = e.target, d = t.dataset;
   if (!isAdmin()) return;
-  if (d.pj !== undefined && t.type === "checkbox") { S.cfg.projects[+d.pj].billable = t.checked; saveCfg(); }
-  if (d.as !== undefined) { const a = (S.cfg.assign[d.as] ??= []); const i = a.indexOf(d.p); if (t.checked && i < 0) a.push(d.p); if (!t.checked && i >= 0) a.splice(i, 1); saveCfg(); }
+  if (d.nd !== undefined) {
+    const n = node(d.nd); if (!n) return;
+    n[d.nk] = t.type === "checkbox" ? t.checked : t.value;
+    saveNodes(); route(); return;
+  }
+  if (d.asg !== undefined) {
+    const a = (S.cfg.assigns || [])[+d.asg]; if (!a) return;
+    a[d.af] = t.value; saveNodes(); route(); return;
+  }
   if (d.uid) { try { await api("/api/users/" + encodeURIComponent(d.uid), "PATCH", { [d.uf]: t.value }); await loadState(); toast("Saved"); } catch (er) { toast("Couldn’t update user: " + er.message); } }
-  if (d.team !== undefined || d.task !== undefined || (d.pj !== undefined && d.k === "name")) route();
+  if (d.team !== undefined) route();
 });
 $("app").addEventListener("click", async e => {
   const b = e.target.closest("[data-act]"); if (!b) return; const a = b.dataset.act, c = S.cfg;
@@ -550,6 +714,36 @@ $("app").addEventListener("click", async e => {
   if (a === "rpXlsx") { xlsxSave(`${slug(REPORTS[U.rpType].split(" (")[0])}_${U.rpFrom}_${U.rpTo}.xlsx`, buildReport(U.rpType, U.rpFrom, U.rpTo, U.rpUser, U.rpProj)); return; }
   if (a === "rpCsv") { const s = buildReport(U.rpType, U.rpFrom, U.rpTo, U.rpUser, U.rpProj)[0]; if (s) downloadCsv(`${slug(s[0])}_${U.rpFrom}_${U.rpTo}.csv`, s[1]); return; }
 
+  if (!isAdmin()) { route(); return; }
+
+  /* ---- work structure ---- */
+  if (a === "addTop") {
+    const nm = ($("newTop") && $("newTop").value.trim()) || "";
+    if (!nm) { toast("Type a name first"); return; }
+    addTop(nm); saveNodes(); route(); toast("Top level added"); return;
+  }
+  if (a === "addMid") {
+    const t0 = node(b.dataset.id); if (!t0) return;
+    addMid(t0.id, "New " + midLabel(t0).toLowerCase()); saveNodes(); route(); return;
+  }
+  if (a === "addTask") {
+    const m = node(b.dataset.id); if (!m) return;
+    addTask(m.id, "New " + taskLabel(topOf(m)).toLowerCase()); saveNodes(); route(); return;
+  }
+  if (a === "hideNode") {
+    const n = node(b.dataset.id); if (!n) return;
+    if (!n.hidden && !confirm(`Hide "${n.name}"?\n\nIt stops appearing on new allocation screens. All hours already recorded against it are kept and still count in reports.`)) return;
+    n.hidden = !n.hidden; saveNodes(); route(); toast(n.hidden ? "Hidden" : "Visible again"); return;
+  }
+  if (a === "addAsg") {
+    const firstMid = Object.values(nodes()).find(n => n.kind === "mid" && !n.hidden);
+    if (!firstMid) { toast("Add a project first"); return; }
+    (S.cfg.assigns ??= []).push({ person: S.cfg.team[0] || "", node: firstMid.id, from: "", to: "" });
+    saveNodes(); route(); return;
+  }
+  if (a === "delAsg") { (S.cfg.assigns || []).splice(+b.dataset.i, 1); saveNodes(); route(); return; }
+
+  /* ---- users ---- */
   if (a === "saveShared") {
     const t = $("shTok").value.trim(); if (!t) { toast("Paste the shared token first"); return; }
     try { await api("/api/shared", "PUT", { token: t }); S.sharedToken = t; toast("Shared token saved"); route(); }
@@ -583,14 +777,9 @@ $("app").addEventListener("click", async e => {
   if (a === "toggleUser") { const u = S.users.find(x => x.uid === b.dataset.uid); if (!u) return;
     try { await api("/api/users/" + encodeURIComponent(u.uid), "PATCH", { active: !u.active }); await loadState(); route(); toast(u.active ? "Deactivated" : "Activated – remember to link a team name"); } catch (er) { toast("Couldn’t update: " + er.message); } return; }
 
-  if (isAdmin()) {
-    if (a === "addTeam") { c.team.push("New person"); saveCfg(); }
-    if (a === "delTeam") { if (!confirm("Remove " + c.team[+b.dataset.i] + "? Their hours stay stored.")) return; c.team.splice(+b.dataset.i, 1); saveCfg(); }
-    if (a === "addPj") { c.projects.push({ name: "New project", type: "", billable: true, planned: 0, cost: "", sf: "" }); saveCfg(); }
-    if (a === "delPj") { if (!confirm("Remove project " + c.projects[+b.dataset.i].name + "?")) return; c.projects.splice(+b.dataset.i, 1); saveCfg(); }
-    if (a === "addTask") { c.tasks.push("New task"); saveCfg(); }
-    if (a === "delTask") { c.tasks.splice(+b.dataset.i, 1); saveCfg(); }
-  }
+  /* ---- team list ---- */
+  if (a === "addTeam") { c.team.push("New person"); saveCfg(); }
+  if (a === "delTeam") { if (!confirm("Remove " + c.team[+b.dataset.i] + "? Their hours stay stored.")) return; c.team.splice(+b.dataset.i, 1); saveCfg(); }
   route();
 });
 
@@ -630,16 +819,16 @@ async function importXlsx(file) {
       else { const m = String(d).match(/(\d{1,2})[-\/.](\d{1,2})[-\/.](\d{4})/); if (!m) continue; d = `${m[3]}-${m[2].padStart(2, "0")}-${m[1].padStart(2, "0")}`; }
       const o = String(cur[1]).trim(), p = String(cur[2]).trim(), task = t.replace(/^dummy tasks?\s*\d+\s*-\s*/i, "").trim() || t;
       if (!c.team.includes(o)) c.team.push(o);
-      if (!proj(p)) c.projects.push({ name: p, type: "", billable: p.toLowerCase() !== "internal", planned: 0, cost: "", sf: "" });
-      if (!c.tasks.includes(task)) c.tasks.push(task);
-      (c.assign[o] ??= []); if (!c.assign[o].includes(p)) c.assign[o].push(p);
+      let mid = Object.values(nodes()).find(x => x.kind === "mid" && x.name === p);
+      if (!mid) { const id = addMid(/^internal$/i.test(p) ? "INT" : "BFS", p); mid = nodes()[id]; }
+      if (!childrenOf(mid.id, "task").some(x => x.name === task)) addTask(mid.id, task);
       const kk = keyOf(d, o, p, task), ex = bulk.get(kk) || {};
       bulk.set(kk, { date: d, owner: o, project: p, task, est: (+ex.est || 0) + est || null, act: (+ex.act || 0) + act || null, comment: [ex.comment, cm].filter(Boolean).join("; ") });
       n++;
     }
   }
   if (!n) { toast("No allocation rows found – the header needs Date, Owner and Task"); return; }
-  try { await api("/api/config", "PUT", S.cfg); const r = await api("/api/entries/bulk", "POST", { items: [...bulk.values()] }); await loadState();
+  try { syncLegacy(); await api("/api/config", "PUT", S.cfg); const r = await api("/api/entries/bulk", "POST", { items: [...bulk.values()] }); await loadState();
         toast(`Imported ${r.saved} entries` + (r.errors.length ? ` (${r.errors.length} skipped)` : "")); route(); }
   catch (e) { toast("Import failed: " + e.message); }
 }
