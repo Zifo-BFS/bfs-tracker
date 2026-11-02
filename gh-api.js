@@ -121,7 +121,6 @@ export async function api(path, method = "GET", body) {
       const f = await fetchDb(); dbCache = f.db; blobSha = f.sha;
       if (!dbCache.users[w.uid]) {
         await commit(db => {
-          const first = Object.keys(db.users).length === 0;
           db.users[w.uid] = { uid: w.uid, username: w.username, name: w.name, role: "admin",
             active: true, member: "", createdAt: Date.now() };
         }, `${w.username}: admin sign-in`);
@@ -161,7 +160,7 @@ export async function api(path, method = "GET", body) {
   if (path === "/api/entry" && method === "PUT") {
     const e = clean(body);
     if (!isAdmin && (!myRec.member || myRec.member !== e.owner)) deny("You can only edit your own allocation.");
-    const id = keyOf(e.date, e.owner, e.project, e.task);
+    const id = keyOf(e);
     const empty = !e.est && !e.act && !String(e.comment || "").trim();
     const rec = empty ? null : { ...e, updatedAt: Date.now(), updatedBy: w.uid, updatedByName: myRec.name || w.username };
     if (empty) delete dbCache.entries[id]; else dbCache.entries[id] = rec;
@@ -173,8 +172,8 @@ export async function api(path, method = "GET", body) {
     if (!isAdmin) deny("Admins only.");
     const items = (body.items || []).map(clean);
     const stamp = e => ({ ...e, updatedAt: Date.now(), updatedBy: w.uid, updatedByName: myRec.name || w.username });
-    items.forEach(e => { dbCache.entries[keyOf(e.date, e.owner, e.project, e.task)] = stamp(e); });
-    await commit(db => items.forEach(e => { db.entries[keyOf(e.date, e.owner, e.project, e.task)] = stamp(e); }),
+    items.forEach(e => { dbCache.entries[keyOf(e)] = stamp(e); });
+    await commit(db => items.forEach(e => { db.entries[keyOf(e)] = stamp(e); }),
       `${whoName()}: import ${items.length} entries`);
     return { saved: items.length, errors: [] };
   }
@@ -184,6 +183,22 @@ export async function api(path, method = "GET", body) {
     dbCache.cfg = body;
     queue("__cfg", db => { db.cfg = body; });
     return { ok: true };
+  }
+
+  if (path === "/api/alias" && method === "PUT") {
+    const id = String(body.id || ""), al = String(body.alias || "");
+    if (!dbCache.cfg || !dbCache.cfg.nodes || !dbCache.cfg.nodes[id]) throw new Error("No such item.");
+    dbCache.cfg.nodes[id].alias = al;
+    queue("__alias_" + id, db => { if (db.cfg && db.cfg.nodes && db.cfg.nodes[id]) db.cfg.nodes[id].alias = al; });
+    return { ok: true };
+  }
+
+  if (path === "/api/entries/replace" && method === "POST") {
+    if (!isAdmin) deny("Admins only.");
+    const ent = body.entries || {};
+    dbCache.entries = ent;
+    await commit(db => { db.entries = ent; }, `${whoName()}: move entries onto permanent IDs`);
+    return { ok: true, count: Object.keys(ent).length };
   }
 
   let m2;
@@ -217,13 +232,17 @@ export async function api(path, method = "GET", body) {
 }
 
 const slug = s => String(s).trim().replace(/[^A-Za-z0-9]+/g, "-").replace(/^-|-$/g, "") || "x";
-const keyOf = (d, o, p, t) => `${d}~${slug(o)}~${slug(p)}~${slug(t)}`;
+const keyOf = e => e.pid && e.tid
+  ? `${e.date}~${slug(e.owner)}~${e.pid}~${e.tid}`
+  : `${e.date}~${slug(e.owner)}~${slug(e.project)}~${slug(e.task)}`;
 function clean(x) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(x.date || "")) throw new Error("Bad date");
   const num = v => { if (v === null || v === "" || v === undefined) return null;
     v = +v; if (isNaN(v) || v < 0 || v > 24) throw new Error("Hours must be between 0 and 24"); return Math.round(v * 100) / 100; };
-  const e = { date: x.date, owner: String(x.owner || "").trim(), project: String(x.project || "").trim(),
-    task: String(x.task || "").trim(), est: num(x.est), act: num(x.act), comment: String(x.comment || "").slice(0, 1000) };
-  if (!e.owner || !e.project || !e.task) throw new Error("Owner, project and task are required");
+  const e = { date: x.date, owner: String(x.owner || "").trim(),
+    pid: x.pid || "", tid: x.tid || "",
+    project: String(x.project || "").trim(), task: String(x.task || "").trim(),
+    est: num(x.est), act: num(x.act), comment: String(x.comment || "").slice(0, 1000) };
+  if (!e.owner || (!e.pid && !e.project)) throw new Error("Owner and project are required");
   return e;
 }
