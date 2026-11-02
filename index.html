@@ -12,27 +12,24 @@
 <script src="vendor/xlsx.full.min.js"></script>
 </head>
 <body>
-<!-- Sign in -->
 <div id="auth" class="authwrap hide">
   <div class="authcard">
     <div class="brand">BFS/ BES Tracker</div>
     <h1 id="authTitle">Sign in</h1>
-    <p class="muted" id="authSub" style="margin:0">Paste the GitHub access token your admin gave you. It stays in this browser only.</p>
+    <p class="muted" id="authSub" style="margin:0">Use the username and passphrase your admin gave you.</p>
     <form id="authForm" autocomplete="on">
-      <label class="f hide" id="nameRow">Your name<input id="aName" autocomplete="name"></label>
-      <label class="f hide" id="emailRow">Work e-mail<input id="aEmail" type="email" autocomplete="email"></label>
-      <label class="f" id="pwRow">GitHub access token<input id="aPw" type="password" autocomplete="current-password" placeholder="github_pat_..."></label>
+      <label class="f" id="userRow">Username<input id="aUser" autocomplete="username"></label>
+      <label class="f" id="passRow">Passphrase<input id="aPass" type="password" autocomplete="current-password" placeholder="word-word-word-..."></label>
+      <label class="f hide" id="tokRow">GitHub access token<input id="aPw" type="password" autocomplete="current-password" placeholder="github_pat_..."></label>
       <div class="err" id="aErr"></div>
       <button class="btn pri" id="aBtn" type="submit">Sign in</button>
     </form>
-    <p style="margin:14px 0 0;font-size:14px;display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap">
-      <button class="linkbtn hide" id="toSignup" type="button">Create an account</button>
-      <button class="linkbtn hide" id="toReset" type="button">Forgot password?</button>
+    <p style="margin:14px 0 0;font-size:14px">
+      <button class="linkbtn" id="toAdmin" type="button">Admin sign-in with GitHub token</button>
     </p>
   </div>
 </div>
 
-<!-- Waiting for approval -->
 <div id="pending" class="authwrap hide">
   <div class="authcard">
     <div class="brand">BFS/ BES Tracker</div>
@@ -42,12 +39,11 @@
   </div>
 </div>
 
-<!-- App -->
 <div id="shell" class="hide">
   <header><div class="bar">
     <div class="brand">BFS/ BES Tracker</div>
     <nav id="nav"></nav>
-    <div class="me"><span class="sync" id="sync"></span><span id="meName"></span><span class="role" id="meRole"></span><button class="btn sm" id="pwBtn">Token</button><button class="btn sm" id="signOut">Sign out</button></div>
+    <div class="me"><span class="sync" id="sync"></span><span id="meName"></span><span class="role" id="meRole"></span><button class="btn sm" id="signOut">Sign out</button></div>
   </div></header>
   <main id="app"></main>
 </div>
