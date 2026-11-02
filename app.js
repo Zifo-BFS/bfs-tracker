@@ -51,6 +51,7 @@ const h = v => { v = Math.round((+v || 0) * 100) / 100; return v ? String(v) : "
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const slug = s => String(s).trim().replace(/[^A-Za-z0-9]+/g, "-").replace(/^-|-$/g, "") || "x";
 const keyOf = (d, o, p, t) => `${d}~${slug(o)}~${slug(p)}~${slug(t)}`;
+const keyOfIds = (d, o, pid, tid) => `${d}~${slug(o)}~${pid}~${tid}`;
 const $ = id => document.getElementById(id);
 
 /* ===================== state ===================== */
@@ -99,8 +100,12 @@ async function loadState() {
   S.users = st.users || [];
   S.sharedToken = st.sharedToken || "";
   const fresh = migrateToNodes();
-  syncLegacy();
-  if (fresh && isAdmin()) saveCfg();
+  const moved = migrateEntries();
+  syncLegacy(); decorate();
+  if ((fresh || moved) && isAdmin()) {
+    saveCfg();
+    if (moved) { try { await api("/api/entries/replace", "POST", { entries: Object.fromEntries(S.entries) }); } catch (e) {} }
+  }
 }
 async function boot() {
   try { S.profile = await api("/api/me"); } catch (e) { showAuth(); return; }
@@ -141,17 +146,19 @@ function startApp() {
 function setSync(t) { $("sync").textContent = t || "● Live"; }
 
 const pending = new Map(); let cfgTimer = null;
-function setEntry(d, o, p, t, patch) {
+function setEntry(d, o, pid, tid, patch) {
   if (!canEditOwner(o)) { toast("You can only edit your own allocation."); return; }
-  const k = keyOf(d, o, p, t);
-  const cur = S.entries.get(k) || { date: d, owner: o, project: p, task: t, est: null, act: null, comment: "" };
-  const nx = { ...cur, ...patch, updatedAt: Date.now(), updatedBy: S.me.uid, updatedByName: S.profile.name };
+  const m = node(pid), t = node(tid); if (!m || !t) return;
+  const k = keyOfIds(d, o, pid, tid);
+  const cur = S.entries.get(k) || { date: d, owner: o, pid, tid, project: dispName(m), task: dispName(t), est: null, act: null, comment: "" };
+  const nx = { ...cur, ...patch, project: dispName(m), task: dispName(t),
+               updatedAt: Date.now(), updatedBy: S.me.uid, updatedByName: S.profile.name };
   const empty = !(+nx.est) && !(+nx.act) && !String(nx.comment || "").trim();
   if (empty) S.entries.delete(k); else S.entries.set(k, nx);
   clearTimeout(pending.get(k)); setSync("Saving…");
   pending.set(k, setTimeout(async () => {
     pending.delete(k);
-    try { const r = await api("/api/entry", "PUT", { date: d, owner: o, project: p, task: t, est: nx.est, act: nx.act, comment: nx.comment });
+    try { const r = await api("/api/entry", "PUT", { date: d, owner: o, pid, tid, project: nx.project, task: nx.task, est: nx.est, act: nx.act, comment: nx.comment });
           if (!pending.has(k)) { if (r.data) S.entries.set(k, r.data); else S.entries.delete(k); } }
     catch (e) { setSync("Not saved"); toast(e.status === 403 ? "Not allowed – you can only edit your own rows." : "Couldn’t save: " + e.message); }
   }, 500));
@@ -261,6 +268,48 @@ function syncLegacy() {
   if (Object.keys(a).length) S.cfg.assign = a;
 }
 function saveNodes() { syncLegacy(); saveCfg(); }
+const dispName = n => n ? (n.alias || n.name) : "";
+
+function decorate() {
+  for (const e of S.entries.values()) {
+    if (!e.pid) continue;
+    const m = node(e.pid), t = node(e.tid);
+    if (m) e.project = dispName(m);
+    if (t) e.task = dispName(t);
+  }
+}
+function migrateEntries() {
+  const out = new Map(); let moved = 0;
+  for (const [k, e] of S.entries) {
+    if (e.pid && e.tid && node(e.pid) && node(e.tid)) { out.set(k, e); continue; }
+    let mid = Object.values(nodes()).find(n => n.kind === "mid" && (n.name === e.project || n.alias === e.project));
+    if (!mid) { const id = addMid(/^internal$/i.test(e.project || "") ? "INT" : "BFS", e.project || "Unsorted"); mid = nodes()[id]; }
+    let tsk = childrenOf(mid.id, "task").find(n => n.name === e.task || n.alias === e.task);
+    if (!tsk) { const id = addTask(mid.id, e.task || "General"); tsk = nodes()[id]; }
+    out.set(keyOfIds(e.date, e.owner, mid.id, tsk.id),
+      { ...e, pid: mid.id, tid: tsk.id, project: dispName(mid), task: dispName(tsk) });
+    moved++;
+  }
+  S.entries = out;
+  return moved;
+}
+function midsFor(person, d) {
+  const all = Object.values(nodes()).filter(n => n.kind === "mid" && !n.hidden);
+  const mine = (S.cfg.assigns || []).filter(a => a.person === person && activeOn(a, d))
+    .map(a => node(a.node)).filter(n => n && !n.hidden);
+  const hasAny = (S.cfg.assigns || []).some(a => a.person === person);
+  const ids = new Set((hasAny ? mine : all).map(n => n.id));
+  for (const e of S.entries.values())
+    if (e.owner === person && e.date === d && e.pid && node(e.pid)) ids.add(e.pid);
+  return [...ids].map(id => node(id)).filter(Boolean)
+    .sort((a, b) => ((topOf(a) || {}).ord || 0) - ((topOf(b) || {}).ord || 0) || (a.ord || 0) - (b.ord || 0));
+}
+function tasksFor(mid, person, d) {
+  const ids = new Set(childrenOf(mid.id, "task").filter(t => !t.hidden).map(t => t.id));
+  for (const e of S.entries.values())
+    if (e.owner === person && e.date === d && e.pid === mid.id && e.tid && node(e.tid)) ids.add(e.tid);
+  return [...ids].map(id => node(id)).filter(Boolean).sort((a, b) => (a.ord || 0) - (b.ord || 0));
+}
 
 /* ===================== routing / permissions ===================== */
 const ALL_VIEWS = [
@@ -351,34 +400,65 @@ function vDash() {
 }
 
 /* ===================== ALLOCATION ===================== */
+const aliasT = new Map();
+function saveAlias(id, val) {
+  const n = node(id); if (!n) return;
+  n.alias = val.trim() === n.name ? "" : val;
+  decorate();
+  clearTimeout(aliasT.get(id)); setSync("Saving…");
+  aliasT.set(id, setTimeout(async () => {
+    try { await api("/api/alias", "PUT", { id, alias: n.alias || "" }); setSync(); }
+    catch (e) { setSync("Not saved"); toast("Couldn’t rename: " + e.message); }
+  }, 700));
+}
+
 function vAlloc() {
   if (!isAdmin() && !myMember()) return `<h1>Weekly allocation</h1><div class="card">Your account isn’t linked to a team name yet. Ask an administrator to link it in Users.</div>`;
   const users = U.alUser === "__all" ? S.cfg.team : [U.alUser];
   const days = workdays(U.alFrom, U.alTo).slice(0, 23);
-  const body = days.map(d => users.map(u => {
+
+  const dayCard = (d, u) => {
     const ed = canEditOwner(u), dis = ed ? "" : "disabled";
-    const ps = (S.cfg.assign[u]?.length ? S.cfg.assign[u] : S.cfg.projects.map(p => p.name)).filter(n => proj(n));
-    const lines = []; ps.forEach(p => S.cfg.tasks.forEach((t, i) => lines.push([p, t, i === 0])));
-    rows({ owner: u, from: d, to: d }).forEach(e => { if (!lines.some(l => l[0] === e.project && l[1] === e.task)) lines.push([e.project, e.task, true]); });
+    const mids = midsFor(u, d);
     const r = rows({ owner: u, from: d, to: d }), est = sum(r, "est"), act = sum(r, "act");
+    let html = "", lastTop = null;
+    mids.forEach(m => {
+      const top = topOf(m) || {};
+      if (top.id !== lastTop) {
+        lastTop = top.id;
+        html += `<tr class="first"><td colspan="5" style="background:var(--head);font-weight:600;font-size:12.5px">${esc(dispName(top))}</td></tr>`;
+      }
+      const ts = tasksFor(m, u, d);
+      if (!ts.length) { html += `<tr><td class="proj">${esc(dispName(m))}</td><td colspan="4" class="muted">No tasks set up yet.</td></tr>`; return; }
+      ts.forEach((t, i) => {
+        const e = S.entries.get(keyOfIds(d, u, m.id, t.id)) || {};
+        const a = `data-d="${d}" data-u="${esc(u)}" data-pid="${esc(m.id)}" data-tid="${esc(t.id)}"`;
+        html += `<tr${i === 0 ? ' class="first"' : ""}>
+          <td class="proj">${i === 0 ? esc(dispName(m)) + (m.hidden ? ` <span class="pill warn">ended</span>` : "") : ""}</td>
+          <td><input class="c" data-ali="${esc(t.id)}" value="${esc(dispName(t))}" title="${esc(t.id)} — rename is shared with the team" style="min-width:150px" ${dis}></td>
+          <td class="n"><input class="n" inputmode="decimal" ${a} data-f="est" value="${h(e.est)}" ${dis}></td>
+          <td class="n"><input class="n" inputmode="decimal" ${a} data-f="act" value="${h(e.act)}" ${dis}></td>
+          <td><input class="c" ${a} data-f="comment" value="${esc(e.comment || "")}" ${dis}></td></tr>`;
+      });
+    });
+    if (!mids.length) html = `<tr><td colspan="5" class="muted">Nothing assigned on this day. Ask an administrator to add an assignment in Setup.</td></tr>`;
     return `<div class="day" style="border-left:6px solid ${color(u)}"><div class="dayhead" style="background:${color(u)}"><h3>${esc(u)} · ${fdl(d)}</h3>
       <span>Estimated <span class="pill ${Math.abs(est - 8) < .01 ? "ok" : "bad"}" data-tot="${d}|${esc(u)}|est">${h(est) || 0} h</span> &nbsp;Actual <span class="pill warn" data-tot="${d}|${esc(u)}|act">${h(act) || 0} h</span>
       ${ed ? `<button class="btn sm" data-act="copyEA" data-d="${d}" data-u="${esc(u)}">Actual = Estimate</button>` : ""}</span></div>
-      <div class="scroll" style="border:0;border-radius:0"><table class="alloc"><thead><tr><th>Project</th><th>Task</th><th class="n">Estimated</th><th class="n">Actual</th><th>Comments</th></tr></thead><tbody>
-      ${lines.map(([p, t, first]) => { const e = S.entries.get(keyOf(d, u, p, t)) || {}; const a = `data-d="${d}" data-u="${esc(u)}" data-p="${esc(p)}" data-t="${esc(t)}"`;
-        return `<tr class="${first ? "first" : ""}"><td class="proj">${first ? esc(p) : ""}</td><td>${esc(t)}</td>
-        <td class="n"><input class="n" inputmode="decimal" ${a} data-f="est" value="${h(e.est)}" ${dis}></td>
-        <td class="n"><input class="n" inputmode="decimal" ${a} data-f="act" value="${h(e.act)}" ${dis}></td>
-        <td><input class="c" ${a} data-f="comment" value="${esc(e.comment || "")}" ${dis}></td></tr>`; }).join("")}
-      </tbody></table></div></div>`; }).join("")).join("");
+      <div class="scroll" style="border:0;border-radius:0"><table class="alloc"><thead><tr><th style="min-width:120px">Project</th><th>Task</th><th class="n">Estimated</th><th class="n">Actual</th><th>Comments</th></tr></thead>
+      <tbody>${html}</tbody></table></div></div>`;
+  };
+
+  const body = days.map(d => users.map(u => dayCard(d, u)).join("")).join("");
   return `<h1>Weekly allocation</h1>
-  <p class="lede">${isAdmin() ? "Pick a person and the dates." : `Your allocation, ${esc(myMember())}.`} Each working day lists the assigned projects and task types. Hours save as you type and feed the BLL and Salesforce views.</p>
+  <p class="lede">${isAdmin() ? "Pick a person and the dates." : `Your allocation, ${esc(myMember())}.`} Only what you are assigned on each day appears. You can rename a task here — everyone sees the new name, and the hours stay attached.</p>
   <div class="controls">${isAdmin() ? `<label class="f">Person<select id="alUser">${userOpts(U.alUser, true)}</select></label>` : ""}
    <label class="f">From<input type="date" id="alFrom" value="${U.alFrom}"></label><label class="f">To<input type="date" id="alTo" value="${U.alTo}"></label>
    <button class="btn sm" data-act="alWeek" data-d="-7">← Previous week</button><button class="btn sm" data-act="alWeek" data-d="7">Next week →</button>
    <button class="btn sm" data-act="alThis">This week</button></div>
   ${days.length ? body : `<div class="card">No working days in that range.</div>`}`;
 }
+
 function updTotals(d, u) {
   const r = rows({ owner: u, from: d, to: d });
   ["est", "act"].forEach(k => { const el = document.querySelector(`[data-tot="${CSS.escape(d + "|" + u + "|" + k)}"]`);
@@ -664,8 +744,9 @@ $("app").addEventListener("input", e => {
   if (d.f) {
     let v = t.value;
     if (d.f !== "comment") { v = v.replace(",", "."); if ((v !== "" && isNaN(+v)) || +v < 0 || +v > 24) { t.style.outline = "2px solid var(--bad)"; return; } t.style.outline = ""; v = v === "" ? null : +v; }
-    setEntry(d.d, d.u, d.p, d.t, { [d.f]: v }); updTotals(d.d, d.u); return;
+    setEntry(d.d, d.u, d.pid, d.tid, { [d.f]: v }); updTotals(d.d, d.u); return;
   }
+  if (d.ali !== undefined) { saveAlias(d.ali, t.value); return; }
   if (!isAdmin()) return;
   if (d.nd !== undefined) {
     const n = node(d.nd); if (!n) return;
@@ -684,6 +765,7 @@ $("app").addEventListener("input", e => {
 });
 $("app").addEventListener("change", async e => {
   const t = e.target, d = t.dataset;
+  if (d.ali !== undefined) { saveAlias(d.ali, t.value); return; }
   if (!isAdmin()) return;
   if (d.nd !== undefined) {
     const n = node(d.nd); if (!n) return;
@@ -705,7 +787,7 @@ $("app").addEventListener("click", async e => {
   if (a === "alThis") { U.alFrom = monday(today); U.alTo = add(U.alFrom, 4); }
   if (a === "sfWk") U.sfWeek = add(U.sfWeek, +b.dataset.d);
   if (a === "prWk") U.prWeek = add(U.prWeek, +b.dataset.d);
-  if (a === "copyEA") { rows({ owner: b.dataset.u, from: b.dataset.d, to: b.dataset.d }).forEach(x => { if (+x.est) setEntry(x.date, String(x.owner).trim(), x.project, x.task, { act: +x.est }); }); toast("Actuals set from estimates"); }
+  if (a === "copyEA") { rows({ owner: b.dataset.u, from: b.dataset.d, to: b.dataset.d }).forEach(x => { if (+x.est && x.pid && x.tid) setEntry(x.date, String(x.owner).trim(), x.pid, x.tid, { act: +x.est }); }); toast("Actuals set from estimates"); }
   if (a === "sfCopy") { const { by } = sfData(U.sfUser, U.sfWeek); copy(Object.entries(by).map(([p, v]) => [p, ...v.map(x => x.toFixed(2))].join("\t")).join("\n")); return; }
   if (a === "sfCsv") { downloadCsv(`Timecard_${slug(U.sfUser)}_${U.sfWeek}.csv`, [SF_HEAD, ...sfRows([U.sfUser], U.sfWeek)]); return; }
   if (a === "prCsv") { xlsxSave(`Prima_${U.prWeek}.xlsx`, [["Prima", [["Person", "Project", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun", "Total"], ...primaRows(U.prUser, U.prWeek)]]]); return; }
@@ -822,8 +904,9 @@ async function importXlsx(file) {
       let mid = Object.values(nodes()).find(x => x.kind === "mid" && x.name === p);
       if (!mid) { const id = addMid(/^internal$/i.test(p) ? "INT" : "BFS", p); mid = nodes()[id]; }
       if (!childrenOf(mid.id, "task").some(x => x.name === task)) addTask(mid.id, task);
-      const kk = keyOf(d, o, p, task), ex = bulk.get(kk) || {};
-      bulk.set(kk, { date: d, owner: o, project: p, task, est: (+ex.est || 0) + est || null, act: (+ex.act || 0) + act || null, comment: [ex.comment, cm].filter(Boolean).join("; ") });
+      const tn = childrenOf(mid.id, "task").find(x => x.name === task || x.alias === task);
+      const kk = keyOfIds(d, o, mid.id, tn.id), ex = bulk.get(kk) || {};
+      bulk.set(kk, { date: d, owner: o, pid: mid.id, tid: tn.id, project: dispName(mid), task: dispName(tn), est: (+ex.est || 0) + est || null, act: (+ex.act || 0) + act || null, comment: [ex.comment, cm].filter(Boolean).join("; ") });
       n++;
     }
   }
