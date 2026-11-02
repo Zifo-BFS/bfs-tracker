@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>BFS/ BES Tracker</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🗂️</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+<script src="vendor/xlsx.full.min.js"></script>
+</head>
+<body>
+<!-- Sign in -->
+<div id="auth" class="authwrap hide">
+  <div class="authcard">
+    <div class="brand">BFS/ BES Tracker</div>
+    <h1 id="authTitle">Sign in</h1>
+    <p class="muted" id="authSub" style="margin:0">Paste the GitHub access token your admin gave you. It stays in this browser only.</p>
+    <form id="authForm" autocomplete="on">
+      <label class="f hide" id="nameRow">Your name<input id="aName" autocomplete="name"></label>
+      <label class="f hide" id="emailRow">Work e-mail<input id="aEmail" type="email" autocomplete="email"></label>
+      <label class="f" id="pwRow">GitHub access token<input id="aPw" type="password" autocomplete="current-password" placeholder="github_pat_..."></label>
+      <div class="err" id="aErr"></div>
+      <button class="btn pri" id="aBtn" type="submit">Sign in</button>
+    </form>
+    <p style="margin:14px 0 0;font-size:14px;display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap">
+      <button class="linkbtn hide" id="toSignup" type="button">Create an account</button>
+      <button class="linkbtn hide" id="toReset" type="button">Forgot password?</button>
+    </p>
+  </div>
+</div>
+
+<!-- Waiting for approval -->
+<div id="pending" class="authwrap hide">
+  <div class="authcard">
+    <div class="brand">BFS/ BES Tracker</div>
+    <h1>Almost there</h1>
+    <p id="pendingMsg">Your account is waiting for an administrator to approve it and link it to your team name.</p>
+    <button class="btn" id="pendingOut">Sign out</button>
+  </div>
+</div>
+
+<!-- App -->
+<div id="shell" class="hide">
+  <header><div class="bar">
+    <div class="brand">BFS/ BES Tracker</div>
+    <nav id="nav"></nav>
+    <div class="me"><span class="sync" id="sync"></span><span id="meName"></span><span class="role" id="meRole"></span><button class="btn sm" id="pwBtn">Token</button><button class="btn sm" id="signOut">Sign out</button></div>
+  </div></header>
+  <main id="app"></main>
+</div>
+<div class="toast" id="toast"></div>
+<script type="module" src="app.js"></script>
+</body>
+</html>
